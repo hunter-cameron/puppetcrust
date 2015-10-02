@@ -1,0 +1,3 @@
+This directory holds scripts to be used for interacting with PICRUSt using my dynamic database system.
+
+In this system, users can select as many or as few genomes as they want to use as a custom PICRUSt database.
