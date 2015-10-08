@@ -12,26 +12,50 @@ class TraitTableEntry(object):
     def __init__(self, name):
         self.name = name
         self.traits = {}
+        self.metadata = {}
 
     def __str__(self):
         return "TraitTableEntry {}".format(self.name)
 
     def add_trait(self, trait, value):
         """ Checks traits to make sure it doesn't already exist in the dict and adds it """
-        if trait in self.traits:
-            raise ValueError("{} already has a trait called '{}'.".format(str(self), trait))
+        # see if we can convert the trait into a number
+        try:
+            value = float(value)
+        except ValueError:
+            pass
+
+        # check if the trait is metadata
+        if trait.startswith("metadata_"):
+            name = trait.split("metadata_")[1]
+                
+            # check if metadata already present
+            if name in self.metadata:
+                raise ValueError("{} already has metadata called '{}'.".format(str(self), name))
+            else:
+                self.metadata[name] = value
         else:
-            # see if we can convert the trait into a number
+            # check if trait already present
+            if trait in self.traits:
+                raise ValueError("{} already has a trait called '{}'.".format(str(self), trait))
+            else:
+                self.traits[trait] = value
+
+    def write(self, fh, traits):
+        to_write = [self.name]
+
+        for trait in traits:
             try:
-                value = float(value)
-            except ValueError:
-                pass
+                to_write.append(str(self.traits[trait]))
+            except KeyError:
+                LOG.warning("Entry {} doesn't have trait {}. Writting 'NA'".format(str(self), trait))
 
-            self.traits[trait] = value
+        fh.write("\t".join(to_write) + "\n")
 
-    def correlation(self, other, traits=None):
+
+    def compare(self, other, metric, traits=None):
         """
-        Finds the correlation between self and other for the listed traits
+        Compares self to other using the supplied metric.
 
         If traits is not suppiled, uses all the traits from self.
 
@@ -67,10 +91,30 @@ class TraitTableEntry(object):
 
         df = pandas.DataFrame.from_dict(pandas_dict, orient="index")
 
-        corr = df.corr(method="spearman")
 
-        return corr.loc["self", "other"]
+        if metric == "correlation":
+            corr = df.corr(method="spearman")
+            return corr.loc["self", "other"]
 
+        elif metric == "disimilarity":
+            # calcs avg disimilarity
+
+            diff = df["self"] - df["other"]
+            diff = diff.abs()
+            diff = diff / len(diff)
+            avg_disim = diff.mean()
+            return avg_disim
+
+        elif metric == "positivepred":
+            # calcs positive predictive value, which ends up being correct calls / total calls
+            diff = df["self"] - df["other"]
+
+            correct = df.count(0)
+            return correct / len(diff)
+
+
+        else:
+            raise ValueError("metric '{}' is invalid.".format(metric))
 
 class TraitTableManager(object):
     """ A class for parsing and manipulating trait tables """
@@ -105,6 +149,7 @@ class TraitTableManager(object):
 
                 tte = TraitTableEntry(name)
 
+                # add all traits
                 for index, val in enumerate(trait_values.split("\t")):
                     tte.add_trait(self.traits[index], val)
 
@@ -132,42 +177,47 @@ class TraitTableManager(object):
 
         return sorted(self.traits, key=nat_sort)
 
+
     def get_subset(self, subset_names, remove=False):
         """
         A filter around the iter method that only gets entries in the subset_names list (or removes them)
-
-
-        Something is wrong with this method and it sometimes returns incorrect results!!!
         """
 
         to_find = len(subset_names)
         found = 0
         for entry in self:
 
+
             # check if we have exhausted the list to speed up the search
             if found == to_find:
                 if remove:
                     yield entry
+                    continue
                 else:
                     return
 
             if entry.name in subset_names:
+                found += 1
 
                 if not remove:
-                    found += 1
                     yield entry
             else:
                 if remove:
-                    found += 1
                     yield entry
 
-    @staticmethod
-    def write_entry(entry, fh, traits):
-        to_write = [entry.name]
 
-        for trait in traits:
-            try:
-                to_write.append(str(entry.traits[trait]))
-            except KeyError:
-                LOG.warning("Entry {} doesn't have trait {}. Writting 'NA'".format(str(entry), trait))
+    def write_subset(self, path, subset_names, remove=False):
+        """
+        Write a new trait table including only a subset of the main one
+        """
 
+        written = []
+        with open(path, 'w') as OUT:
+            # write headers
+            OUT.write("\t".join(["OTU"] + self.traits) + "\n")
+            
+            for entry in self.get_subset(subset_names, remove):
+                written.append(entry.name)
+                entry.write(OUT, self.traits)
+            
+            return written
