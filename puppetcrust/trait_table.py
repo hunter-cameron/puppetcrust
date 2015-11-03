@@ -1,4 +1,7 @@
 
+from __future__ import division
+
+
 import pandas
 import logging
 
@@ -52,7 +55,6 @@ class TraitTableEntry(object):
 
         fh.write("\t".join(to_write) + "\n")
 
-
     def compare(self, other, metric, traits=None):
         """
         Compares self to other using the supplied metric.
@@ -92,18 +94,19 @@ class TraitTableEntry(object):
         df = pandas.DataFrame.from_dict(pandas_dict, orient="index")
 
 
-        if metric == "correlation":
+        if metric == "spearman":
             corr = df.corr(method="spearman")
             return corr.loc["self", "other"]
 
         elif metric == "disimilarity":
-            # calcs avg disimilarity
+            # calcs squared Euclidian distance / num traits
+            # I picked this distance metric becuase it weights predictions that are more wrong higher
 
             diff = df["self"] - df["other"]
             diff = diff.abs()
-            diff = diff / len(diff)
-            avg_disim = diff.mean()
-            return avg_disim
+            diff = diff ** 2
+            sq_euc = diff.sum()
+            return sq_euc / len(df.index)
 
         elif metric == "positivepred":
             # calcs positive predictive value, which ends up being correct calls / total calls
@@ -155,6 +158,62 @@ class TraitTableManager(object):
 
                 yield tte
 
+    @classmethod
+    def compare_two_tables(cls, tab1, tab2, to_compare=None, metric="disimilarity"):
+        """ This is a convenience method that compares the entries in the list to_compare (all from tab1 if is None) from the two trait tables. Returns a dict indexed by the names in to_compare """
+
+        # Open up a manager for each table.
+        # should do a simple check here to allow users to sumbit ttm's as well as files
+        ttm1 = cls(tab1)
+        ttm2 = cls(tab2)
+
+        # get a list of entries from the first table for quick comparisons
+        if to_compare is None:
+            LOG.info("Using all the entries from table 1 for the comparision.")
+            comp_entries = [entry for entry in ttm1]
+        else:
+
+            comp_entries = [entry for entry in ttm1 if entry.name in to_compare]
+            
+            # check for names not found in table 1
+            entry_names = [entry.name for entry in comp_entries]
+            missing = []
+            for name in to_compare:
+                if name not in entry_names:
+                    missing.append(name)
+
+            if missing:
+                print("Missing Names:")
+                for name in missing:
+                    print(name)
+
+                raise ValueError("Some names from to_compare not found in table 1. See stdout for details. Refusing to continue.")
+            else:
+                LOG.info("Found all names from to_compare in table 1.")
+
+        results = {entry.name: None for entry in comp_entries}
+        for comp in comp_entries:
+            for comp2 in ttm2:
+                if comp.name == comp2.name:
+                    results[comp.name] = {metric: comp.compare(comp2, metric=metric)}
+
+                    # try to get a NSTI value
+                    try:
+                        results[comp.name]["NSTI"] = comp.metadata["NSTI"]
+                    except KeyError:
+                        try:
+                            results[comp.name]["NSTI"] = comp2.metadata["NSTI"]
+                        except KeyError:
+                            pass
+
+
+        # make sure all genomes were compared successfully
+        for genome in results:
+            if results[genome] is None:
+                raise ValueError("Calculation failed for genome '{}'".format(genome))
+
+        return results
+    
     def get_ordered_traits(self, metadata_last=True):
         """ Returns an ordered list of traits by a natural sort algorithm that optionally sends metadata to the back. """
 
@@ -176,7 +235,6 @@ class TraitTableManager(object):
 
 
         return sorted(self.traits, key=nat_sort)
-
 
     def get_subset(self, subset_names, remove=False):
         """
@@ -204,7 +262,6 @@ class TraitTableManager(object):
             else:
                 if remove:
                     yield entry
-
 
     def write_subset(self, path, subset_names, remove=False):
         """

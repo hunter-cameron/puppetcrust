@@ -24,7 +24,7 @@ def _check_and_mkdir(path):
 class BootStrapper(object):
     """ Bundles the data and methods required for a bootstrapped experiment """
     
-    def __init__(self, tree, traits, k, work_dir):
+    def __init__(self, tree, traits, k, work_dir, to_test=None):
         self.tree_f = tree
         self.traits_f = traits
         self.k = k
@@ -33,11 +33,20 @@ class BootStrapper(object):
         # make work_dir if it doesn't exist
         _check_and_mkdir(self.work_dir)
         
+        # read in to_test genomes if necessary
+        if to_test is None:
+            self.to_test = None
+        else:
+            self.to_test = []
+            with open(to_test, 'r') as IN:
+                for line in IN:
+                    self.to_test.append(line.strip())
+                    
 
         # init for later use
         self.kfolds = []
 
-    def run(self, bootstrap=1):
+    def run(self, bootstrap, metric):
 
         LOG.info("Beginning bootstraping. Iterations={}".format(str(bootstrap)))
 
@@ -46,13 +55,14 @@ class BootStrapper(object):
             job_dir = self.work_dir + "/" + "kfolds" + str(job)
         
             kfolder = KFolder(tree=self.tree_f, traits=self.traits_f, work_dir=job_dir)
-            kfolder.make_partitions(k=self.k)
+            kfolder.make_partitions(k=self.k, to_test=self.to_test)
             self.kfolds.append(kfolder)
 
         # wait for them all to complete and process the results
-        #pandas_dict = {"best"={}}
+        pandas_dict = {}
         for indx, kfolder in enumerate(self.kfolds):
-            kfolder.analyze()
+            LOG.info("Processing iteration {}...".format(indx))
+            kfolder.analyze(metric=metric)
             pandas_dict["iter" + str(indx)] = kfolder.results
          
         """
@@ -68,7 +78,7 @@ class BootStrapper(object):
         """
 
         df = pandas.DataFrame.from_dict(pandas_dict, orient="columns")
-        df.to_csv(self.work_dir + "/" + "summary.tab", sep="\t", index_label="genome")
+        df.to_csv(self.work_dir + "/" + "summary.{}.tab".format(metric), sep="\t", index_label="genome")
 
 
 class KFolder(object):
@@ -89,18 +99,44 @@ class KFolder(object):
 
         LOG.info("Initialized K-Folds experiment in directory '{}'.".format(work_dir))
 
-    def make_partitions(self, k, seed=0):
+
+    def make_partitions(self, k, to_test=None, seed=0):
         """ Randomly makes partitions of the traits table """
+        
+        # try to load partitions
+        for group in range(k):
+            try:
+                partition = Partition.load_partition(self, self.work_dir + "/" + "partition{}".format(group))
+                self.partitions.append(partition)
+            except ValueError:
+                
+                # if error at first this is likely a new run
+                if group == 0:
+                    break
+                else:
+                    raise ValueError("Successfully loaded some partitions but failed to load others. Refusing to run analysis in this directory. Please delete the output directory or select a new location.")
+        else:
+            LOG.info("Successfully loaded partitions.")
+            return
 
         # get genomes from the external nodes of the tree
         # comments_are_confidence allows me to keep the digit only node names
         # this parser tries to conv names to confidence otherwise
         tree = Phylo.read(self.tree_f, "newick", comments_are_confidence=True)
         genomes = [node.name for node in tree.get_terminals()]
+        
+        # make sure all the genomes in to_test are in the tree and then use only to test genomes for the rest
+        if to_test:
+            for genome in to_test:
+                if not genome in genomes:
+                    raise ValueError("Genome in test set '{}' is not in the tree. Aborting.".format(genome))
+            genomes = to_test
+
 
         # calculate the number of genomes per group
         genomes_per_group = int(len(genomes) / k)
         remainder = len(genomes) % k
+
 
         # make random groups
         for group in range(k):
@@ -122,12 +158,15 @@ class KFolder(object):
         
             LOG.info("Created partition {} with n={}.".format(str(group), str(count)))
 
-    def analyze(self):
+    def analyze(self, metric):
         # wait for all to finish and then process 
         for p in self.partitions:
-            LOG.info("Waiting for partition in '{}' to finish.".format(p.work_dir))
-            executer.PicrustExecuter.wait_for_job(p.job_name)
-            p.parse_results()
+            try:
+                p.parse_results(metric)
+            except:
+                LOG.info("Waiting for partition in '{}' to finish.".format(p.work_dir))
+                executer.PicrustExecuter.wait_for_job(p.job_name)
+                p.parse_results(metric)
 
             # add the results to the overall results
             self.results.update(p.results)
@@ -153,6 +192,39 @@ class Partition(object):
         self.pred_traits_f = None
         self.results = {g: None for g in self.genomes}
 
+    @classmethod
+    def load_partition(cls, kfolder, partition_dir):
+        """ Loads a partition from a directory. """
+        
+        # see if the partition directory even exists
+        if os.path.isdir(partition_dir):
+            partition = cls(genomes=[], kfolder=kfolder, work_dir=partition_dir)
+
+            # read in the genomes
+            if os.path.isfile(partition.test_genomes_f):
+                with open(partition.test_genomes_f, 'r') as IN:
+                    for line in IN:
+                        partition.genomes.append(line.strip())
+
+                partition.results = {g: None for g in partition.genomes}
+
+                # see what other work needs to be done
+                if not os.path.isfile(partition.ref_traits_f):
+                    partition.write_ref_traits()
+
+                # check if PICRUSt has already run
+                if os.path.isfile(partition.work_dir + "/" + "predicted_traits.tab"):
+                    partition.pred_traits_f = partition.work_dir + "/" + "predicted_traits.tab"
+                else:
+                    partition.run_picrust()
+
+                return partition
+
+            else:
+                raise ValueError("Test genomes file doesn't exist.")
+        else:
+            raise ValueError("Partition directory doesn't exist.")
+
     def run(self):
         self.write_test_genomes()
         self.write_ref_traits()
@@ -172,9 +244,9 @@ class Partition(object):
 
     def run_picrust(self):
         self.job_name, self.pred_traits_f = executer.PicrustExecuter.predict_traits_wf(
-                tree=self.kfolder.tree_f, trait_table=self.ref_traits_f, base_dir=self.work_dir)
+                tree=self.kfolder.tree_f, trait_table=self.ref_traits_f, limit=self.test_genomes_f, base_dir=self.work_dir)
 
-    def parse_results(self):
+    def parse_results(self, metric):
         obs_ttm = self.kfolder.ttm
         pred_ttm = trait_table.TraitTableManager(self.pred_traits_f)
 
@@ -184,7 +256,7 @@ class Partition(object):
             for pred in pred_ttm:
                 if obs.name == pred.name:
                     # if changed, make sure to change the best column (right now it assumes > is better)
-                    self.results[obs.name] = obs.compare(pred, metric="correlation")
+                    self.results[obs.name] = obs.compare(pred, metric=metric)
 
         # make sure all genomes were found
         for genome in self.results:
@@ -196,14 +268,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Runs k-folds validation on PICRUSt predictions and reports a table with average accuracy per genome. Optionally includes a bootstrapping step.")
 
     parser.add_argument("-tree", help="tree that includes all the genomes to test", required=True)
+    parser.add_argument("-test", help="an optional file of genome names to test (if not the whole tree)")
     parser.add_argument("-traits", help="a table of traits for each genome to test", required=True)
     parser.add_argument("-k", help="number of groups to use. Default=%(default)s", type=int, default=10)
     parser.add_argument("-bootstrap", help="number of iterations. Default=%(default)s", type=int, default=1)
+    parser.add_argument("-metric", help="the metric to use for accuracy", choices=["spearman", "disimilarity"], default="spearman")
     parser.add_argument("-outdir", help="directory to store the output. Default=%(default)s", default=os.getcwd())
 
     args = parser.parse_args()
 
     LOG.setLevel(logging.INFO)
 
-    bstrap = BootStrapper(args.tree, args.traits, args.k, args.outdir)
-    bstrap.run(args.bootstrap)
+    bstrap = BootStrapper(args.tree, args.traits, args.k, args.outdir, to_test=args.test)
+    bstrap.run(args.bootstrap, args.metric)
