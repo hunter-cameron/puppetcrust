@@ -4,6 +4,7 @@ from __future__ import division
 
 import pandas
 import logging
+import math
 
 logging.basicConfig()
 LOG = logging.getLogger(__name__)
@@ -105,7 +106,8 @@ class TraitTableEntry(object):
             diff = df["self"] - df["other"]
             diff = diff.abs()
             diff = diff ** 2
-            sq_euc = diff.sum()
+            sq_euc = math.sqrt(diff.sum())
+        
             return sq_euc / len(df.index)
 
         elif metric == "positivepred":
